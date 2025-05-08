@@ -1,14 +1,15 @@
 """
 SAC
 """
-import gym
+import gymnasium
 import os
-import d4rl
+import neorl2
 import numpy as np
 import torch
 from tqdm import tqdm
 from util import sample_one_step, sample_one_step_random, set_seed, Log, evaluate_sdv
 
+import wandb
 import time
 
 from util import DEFAULT_DEVICE
@@ -18,12 +19,13 @@ from algo.sac import SACPolicy
 from algo.mbpo import MBPO
 
 def get_env_and_dataset(env_name):
-    env = gym.make(env_name)
+    env = gymnasium.make(env_name)
     return env
 
 def main(args, logger):
 
     #torch.set_num_threads(1)
+    run = wandb.init(project="SAC-NeoRL2", config=vars(args), name=f"SAC-{args.env_name}-{args.seed}-{int(time.time())}")
 
     env = get_env_and_dataset(args.env_name)
     obs_dim = env.observation_space.shape[0]
@@ -117,7 +119,7 @@ def main(args, logger):
             ret, _, _, _ = evaluate_sdv(env, mb_algo)
             eval_returns.append(ret)
         eval_returns = np.array(eval_returns)
-        normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
+        normalized_returns = env.get_normalized_score(eval_returns)
         #print(f"return mean: {eval_returns.mean()},normalized return mean: {normalized_returns.mean()},Q error: {eval_errors.mean()}")
         msg = {
             'step': step,
@@ -128,12 +130,14 @@ def main(args, logger):
         for k, v in model_loss.items():
             msg[k] = v
         logger.row(msg)
+        wandb.log(msg)
+        
         return normalized_returns.mean()
     
     # SAC
     print("ONLINE TRAINNING!")
-    online_env = gym.make(args.env_name)
-    online_env.seed(seed=args.seed)
+    online_env = gymnasium.make(args.env_name)
+    online_env.reset(seed=args.seed)
     num_timesteps = 0
     eval_sdv(num_timesteps)
     train_epochs = args.train_steps // args.max_episode_steps
@@ -141,14 +145,14 @@ def main(args, logger):
     for e in range(1, train_epochs + 1):
         mb_algo.policy.train()
         done = False
-        obs = online_env.reset()
+        obs, _ = online_env.reset()
         print(f"Epoch #{e}/{train_epochs}")
         ep_step = 1
         # get online data 
         with tqdm(total=step_per_epoch, desc=f"Online Sampling") as t:
             while t.n < t.total:
                 if done: 
-                    obs = online_env.reset()
+                    obs, _ = online_env.reset()
                     ep_step = 1
                 # Interact with environment
                 if num_timesteps > 1000:
@@ -161,19 +165,22 @@ def main(args, logger):
                 if num_timesteps > 1000:
                     for _ in range(args.utd):
                         loss = mb_algo.learn_pure_policy()
+                        wandb.log(loss)
                         t.set_postfix(**loss)
                 t.update(1)
                 # Evaluate current policy
             eval_sdv(num_timesteps)
         # Save policy
-        torch.save(mb_algo.policy.state_dict(), os.path.join(args.model_dir,args.env_name, f"seed_{args.seed}_normalize-{args.normalize}_SACPolicy.pth"))  
-
+        save_path = os.path.join(args.model_dir,args.env_name)
+        os.makedirs(save_path, exist_ok= True)
+        torch.save(mb_algo.policy.state_dict(), os.path.join(save_path, f"seed_{args.seed}_normalize-{args.normalize}_SACPolicy.pth"))  
+    run.finish()
 if __name__ == '__main__':
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--env_name', type=str, default="hopper-medium-replay-v2")
-    parser.add_argument('--log_dir', type=str, default="./fixpuresaclog")
-    parser.add_argument('--model_dir', type=str, default="./othermodels/")
+    parser.add_argument('--env_name', type=str, default="RocketRecovery")
+    parser.add_argument('--log_dir', type=str, default="./sac_log")
+    parser.add_argument('--model_dir', type=str, default="./models/")
     parser.add_argument('--seed', type=int, default=1) #try 13
     parser.add_argument('--discount', type=float, default=0.99)
     parser.add_argument('--hidden_dim', type=int, default=256)
@@ -183,12 +190,12 @@ if __name__ == '__main__':
     parser.add_argument('--tau', type=float, default=0.7)
     parser.add_argument('--alpha', type=float, default=10.0)
     parser.add_argument('--n_eval_episodes', type=int, default=10)
-    parser.add_argument('--max_episode_steps', type=int, default=1000)
+    parser.add_argument('--max_episode_steps', type=int, default=500)
     parser.add_argument("--normalize", action='store_true')
     parser.add_argument('--mle_test', action='store_true')
     parser.add_argument('--pure', action='store_true')
     # SAC
-    parser.add_argument("--sac_actor_lr", type=float, default=3e-4)
+    parser.add_argument("--sac_actor_lr", type=float, default=1e-4)
     parser.add_argument("--sac_critic_lr", type=float, default=3e-4)
     parser.add_argument("--sac_gamma", type=float, default=0.99)
     parser.add_argument("--sac_tau", type=float, default=0.005)

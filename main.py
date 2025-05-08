@@ -14,12 +14,13 @@ import random
 
 from matplotlib import pyplot as plt
 
-import gym
+import gymnasium as gym
 import os
-import d4rl
+import neorl2
 import numpy as np
 import torch
 from tqdm import trange, tqdm
+import wandb
 from algo.PriorityBuffer import PriorityReplayBuffer
 
 from sdv import SDV
@@ -36,27 +37,39 @@ from algo.policy_models import MLP, ActorProb, Critic, DiagGaussian
 from algo.sac import SACPolicy
 from algo.mbpo import MBPO
 
+def transfer_dataset(dataset):
+    ret_dataset = {}
+    ret_dataset['observations'] = dataset['obs']
+    ret_dataset['next_observations'] = dataset['next_obs']
+    ret_dataset['actions'] = dataset['action']
+    ret_dataset['rewards'] = dataset['reward']
+    ret_dataset['terminals'] = dataset['done']
+    #ret_dataset['truncated'] = dataset['truncated']
+    return ret_dataset
+
 def get_env_and_dataset(env_name, max_episode_steps, normalize, online=False):
     env = gym.make(env_name)
-    dataset = d4rl.qlearning_dataset(env)
+    dataset, _ = env.get_dataset()
+    print(dataset.keys())
+    
+    dataset = transfer_dataset(dataset)
 
     if online:
         obs_n = dataset['observations'].shape[0]
         idxs = random.sample(range(0,obs_n),min(obs_n,5*10**4))
         for k in dataset.keys():
             dataset[k] = dataset[k][idxs]
-    if any(s in env_name for s in ('halfcheetah', 'hopper', 'walker2d')):
+    if any(s in env_name for s in ('RocketRecovery', 'DMSD')):
         min_ret, max_ret = return_range(dataset, max_episode_steps)
         print(f'Dataset returns have range [{min_ret}, {max_ret}]')
-        print(f'max score: {d4rl.get_normalized_score(args.env_name, max_ret) * 100.0}')
-        if args.reward_norm:
-            Nr = max_episode_steps / (max_ret - min_ret)
-            dataset['rewards'] /= (max_ret - min_ret)
-            dataset['rewards'] *= max_episode_steps
+        print(f'max score: {env.get_normalized_score(max_ret)}')
+        #Nr = max_episode_steps / (max_ret - min_ret)
+        dataset['rewards'] /= (max_ret - min_ret)
+        dataset['rewards'] *= max_episode_steps
     else:
         min_ret, max_ret = return_range(dataset, max_episode_steps)
         print(f'Dataset returns have range [{min_ret}, {max_ret}]')
-        print(f'max score: {d4rl.get_normalized_score(args.env_name, max_ret) * 100.0}')
+        print(f'max score: {env.get_normalized_score(max_ret) * 100.0}')
 
     print("***********************************************************************")
     print(f"Normalize for the state: {normalize}")
@@ -88,6 +101,7 @@ def get_env_and_dataset(env_name, max_episode_steps, normalize, online=False):
     return env, dataset, mean, std, max_ret, min_ret
 
 def main(args, logger):
+    run = wandb.init(project="SDV-NeoRL2", config=vars(args), name=f"SDV-{args.env_name}-{args.seed}-{int(time.time())}")
 
     #torch.set_num_threads(1)
 
@@ -237,16 +251,19 @@ def main(args, logger):
                     if args.only_model:
                         if step % args.max_episode_steps == 0:
                             logger.row(losses)
+                            wandb.log(losses)
                 elif args.type == 'sdv_b':
                     losses = sdv.no_adv_update(**sample_batch(dataset, args.batch_size))
                     if args.only_model:
                         if step % args.max_episode_steps == 0:
                             logger.row(losses)
+                            wandb.log(losses)
                 elif args.type == 'sdv_s':
                     losses = sdv.double_T(**sample_batch(dataset,args.batch_size*2))
                     if args.only_model:
                         if step % args.max_episode_steps == 0:
                             logger.row(losses)
+                            wandb.log(losses)
                 else:
                     raise(NotImplementedError)
             sdv.save(f"{args.model_dir}/{args.env_name}/seed_{args.seed}_{algo_name}")
@@ -294,7 +311,7 @@ def main(args, logger):
             ret, _, _, _ = evaluate_sdv(env, mb_algo, mean, std)
             eval_returns.append(ret)
         eval_returns = np.array(eval_returns)
-        normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
+        normalized_returns = env.get_normalized_score(eval_returns)
         msg = {
             'step': step,
             'return mean': eval_returns.mean(),
@@ -304,6 +321,7 @@ def main(args, logger):
         for k, v in model_loss.items():
             msg[k] = v
         logger.row(msg)
+        wandb.log(msg)
         return normalized_returns.mean()
 
     # SAC
@@ -325,6 +343,7 @@ def main(args, logger):
                     # update policy by sac
                     loss = mb_algo.learn_policy()
                     t.set_postfix(**loss)
+                    wandb.log(loss)
                     num_timesteps += 1
                     t.update(1)
             # evaluate current policy
@@ -334,10 +353,12 @@ def main(args, logger):
                 eval_log.write(f'{num_timesteps + 1}\t{average_returns}\n')
                 eval_log.flush()
                 # save policy
+                save_path = os.path.join(args.model_dir,args.env_name)
+                os.makedirs(save_path, exist_ok= True)
                 if args.trace_policy and e % 100 == 0:
-                    torch.save(mb_algo.policy.state_dict(), os.path.join(args.model_dir,args.env_name, f"seed_{args.seed}_policy_iter{e}_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth"))
+                    torch.save(mb_algo.policy.state_dict(), os.path.join(save_path, f"seed_{args.seed}_policy_iter{e}_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth"))
                 else:
-                    torch.save(mb_algo.policy.state_dict(), os.path.join(args.model_dir,args.env_name, f"seed_{args.seed}_policy_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth"))
+                    torch.save(mb_algo.policy.state_dict(), os.path.join(save_path, f"seed_{args.seed}_policy_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth"))
         if args.fake_env:
             mb_algo.plot_qs()    
         eval_log.close()
@@ -346,7 +367,7 @@ def main(args, logger):
             # ONLY ONLINE SAMPLES
             online_env = Normalizer(gym.make(args.env_name))
             online_env.init(env.mean, env.std, env.Nr)
-            online_env.seed(seed=args.seed)
+            online_env.reset(seed=args.seed)
             print(online_env.mean)
             print(online_env.std)
             num_timesteps = 0
@@ -356,13 +377,13 @@ def main(args, logger):
             for e in range(0, train_epochs + 1):
                 mb_algo.policy.train()
                 done = False
-                obs = online_env.reset()
+                obs, _ = online_env.reset()
                 ep_step = 1
                 print(f"Epoch #{e}/{train_epochs}")
                 with tqdm(total=step_per_epoch, desc=f"Updating") as t:
                     while t.n < t.total:
                         if done:
-                            obs = online_env.reset()
+                            obs, _ = online_env.reset()
                             ep_step = 1
                         # Interact with environment
                         obs, done = sample_one_step(obs, online_env, mb_algo, ep_step, args.max_episode_steps)
@@ -372,12 +393,15 @@ def main(args, logger):
                         if num_timesteps > 1000:
                             loss = mb_algo.learn_pure_policy()
                             t.set_postfix(**loss)
+                            wandb.log(loss)
                         t.update(1)
                 # Evaluate current policy
                 if e > 1:
                     eval_sdv(num_timesteps)
                 # Save policy
-                torch.save(mb_algo.policy.state_dict(), os.path.join(args.model_dir,args.env_name, f"seed_{args.seed}_normalize-{args.normalize}_SACPolicy.pth"))
+                save_path = os.path.join(args.model_dir,args.env_name)
+                os.makedirs(save_path, exist_ok= True)
+                torch.save(mb_algo.policy.state_dict(), os.path.join(save_path, f"seed_{args.seed}_normalize-{args.normalize}_SACPolicy.pth"))
         elif args.online:
             model_dict = torch.load(os.path.join(args.model_dir,args.env_name, f"policy_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth"),map_location=DEFAULT_DEVICE)
             mb_algo.policy.load_state_dict(model_dict)
@@ -385,7 +409,7 @@ def main(args, logger):
             print("ONLINE TRAINNING!")
             online_env = Normalizer(gym.make(args.env_name))
             online_env.init(env.mean, env.std, env.Nr)
-            online_env.seed(seed=args.seed)
+            online_env.reset(seed=args.seed)
             print(online_env.mean)
             print(online_env.std)
             print("Load offline data......")
@@ -407,7 +431,7 @@ def main(args, logger):
                 mb_algo.policy.train()
                 #env.set_fine_tune(True)
                 done = False
-                obs = online_env.reset()
+                obs, _ = online_env.reset()
                 ep_step = 1
                 # generate fake transitions
                 if real_ratio < 1:
@@ -420,7 +444,7 @@ def main(args, logger):
                 with tqdm(total=step_per_epoch, desc=f"Online Sampling") as t:
                     while t.n < t.total:
                         if done:
-                            obs = online_env.reset() 
+                            obs, _ = online_env.reset() 
                             ep_step = 1
                         obs, done = sample_one_step(obs, online_env, mb_algo, ep_step, args.max_episode_steps)
                         num_timesteps += 1
@@ -453,6 +477,7 @@ def main(args, logger):
                         else:
                             loss = mb_algo.learn_pure_policy()
                         t.set_postfix(**loss)
+                        wandb.log(loss)
                         t.update(1)
                
                 real_ratio = min(1, real_ratio + real_ratio_delta)
@@ -462,14 +487,17 @@ def main(args, logger):
                 # evaluate current policy
                 if e >= 1: eval_sdv(num_timesteps, (priority,off_rate))
                 # save policy
-                pathname = os.path.join(args.model_dir,args.env_name, f"seed_{args.seed}_OnlinePolicy_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth")
+                save_path = os.path.join(args.model_dir,args.env_name)
+                os.makedirs(save_path, exist_ok= True)
+                pathname = os.path.join(save_path, f"seed_{args.seed}_OnlinePolicy_alpha-{args.alpha}_normalize-{args.normalize}_type-{args.type}.pth")
                 torch.save(mb_algo.policy.state_dict(), pathname)   
+    run.finish()
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--env_name', type=str, default="hopper-medium-replay-v2")
-    parser.add_argument('--root_log_dir', type=str, default="./exp_log")
+    parser.add_argument('--env_name', type=str, default="RocketRecovery")
+    parser.add_argument('--root_log_dir', type=str, default="./sdv_log")
     parser.add_argument('--log_dir', type=str, default="./results/")
     parser.add_argument('--model_dir', type=str, default="./models/")
     parser.add_argument('--seed', type=int, default=1) #try 13
@@ -485,8 +513,8 @@ if __name__ == '__main__':
     parser.add_argument('--policy_lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=10.0)
     parser.add_argument('--eval_period', type=int, default=1000)
-    parser.add_argument('--n_eval_episodes', type=int, default=5)
-    parser.add_argument('--max_episode_steps', type=int, default=1000)
+    parser.add_argument('--n_eval_episodes', type=int, default=10)
+    parser.add_argument('--max_episode_steps', type=int, default=500)
     parser.add_argument("--normalize", action='store_true')
     parser.add_argument("--type", type=str, choices=['sdv_t','sdv_s', 'sdv_b'], default='sdv_t')
     parser.add_argument("--pretrain", action='store_true')
@@ -511,7 +539,7 @@ if __name__ == '__main__':
 
     # MBPO
     parser.add_argument("--rollout_freq", type=int, default=1000)
-    parser.add_argument("--rollout_length", type=int, default=5)
+    parser.add_argument("--rollout_length", type=int, default=1)
     parser.add_argument("--real_ratio", type=float, default=0.5)
     parser.add_argument("--log_freq", type=int, default=1000)
     parser.add_argument("--reward_penalty_coef", type=float, default=1.0)

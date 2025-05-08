@@ -5,8 +5,8 @@ import random
 import string
 import sys
 import os
-import gym
-from gym.core import Env
+import gymnasium as gym
+from gymnasium.core import Env
 
 import numpy as np
 import torch
@@ -24,7 +24,7 @@ class Normalizer(gym.Wrapper):
         self.fine_tune = False
 
     def step(self, action):
-        observation, reward, done, info = self.env.step(action)
+        observation, reward, terminated, truncated, info = self.env.step(action)
         
         if self.fine_tune:
             self.std  = (1 - self.alpha) * self.std + self.alpha * np.abs(observation - self.mean)
@@ -32,12 +32,15 @@ class Normalizer(gym.Wrapper):
 
         observation = (observation - self.mean) / self.std
         reward *= self.Nr
-        return observation, reward, done, info
+        return observation, reward, terminated, truncated, info
     
-    def reset(self):
-        observation = self.env.reset()
+    def reset(self, seed=None):
+        if seed is not None:
+            observation, info = self.env.reset(seed=seed)
+        else:
+            observation, info = self.env.reset()
         observation = (observation - self.mean) / self.std
-        return observation
+        return observation, info # info is not normalized...
     
     def init(self, mean, std, Nr=1):
         assert self.mean.shape == mean.shape
@@ -205,7 +208,7 @@ def rvs_sample_batch(dataset, batch_size):
 
 def evaluate_sdv(eval_env, algo, mean=0.0, std=1.0, gamma=0.99):
         algo.policy.eval()
-        obs = eval_env.reset()
+        obs, _ = eval_env.reset()
         Q_pi = 0
         #init_obs = obs.reshape(1,-1)
         #act = algo.policy.sample_action(init_obs, deterministic=True)
@@ -217,7 +220,8 @@ def evaluate_sdv(eval_env, algo, mean=0.0, std=1.0, gamma=0.99):
         while not done:
             # obs = (obs - mean)/std
             action = algo.policy.sample_action(obs, deterministic=True)
-            obs, reward, done, _ = eval_env.step(action)
+            obs, reward, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
             total_reward += reward
             rs.append(reward)
             i += 1
@@ -233,11 +237,13 @@ def sample_one_step(obs, env, algo, episode_steps, max_episode_steps):
         algo.policy.eval()
         #obs = (obs - mean)/std
         action = algo.policy.sample_action(obs)
-        next_obs, reward, done, _ = env.step(action)
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         #reward = reward * Nr
         #algo.r_max = max(algo.r_max, reward)
         #algo.r_min = min(algo.r_min, reward)
-        terminal = 0 if episode_steps == max_episode_steps else done
+        terminal = terminated 
+        # if episode_steps == max_episode_steps else done
         algo.online_buffer.add(obs, next_obs, action, reward, terminal)
         algo.real_priority_buffer.add(obs, next_obs, action, reward, terminal)
         return next_obs, done
@@ -246,8 +252,9 @@ def sample_one_step_random(obs, env, algo, episode_steps, max_episode_steps):
     with torch.no_grad():
         algo.policy.eval()
         action = env.action_space.sample()
-        next_obs, reward, done, _ = env.step(action)
-        terminal = 0 if episode_steps == max_episode_steps else done
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        terminal = terminated 
         algo.online_buffer.add(obs, next_obs, action, reward, terminal)
         return next_obs, done
 
@@ -258,7 +265,7 @@ def set_seed(seed, env=None):
     np.random.seed(seed)
     random.seed(seed)
     if env is not None:
-        env.seed(seed=seed+42)
+        env.reset(seed=seed+42)
 
 def save(dir ,filename, env_name, network_model):
     if not os.path.exists(dir):
