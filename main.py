@@ -59,7 +59,7 @@ def get_env_and_dataset(env_name, max_episode_steps, normalize, online=False):
         idxs = random.sample(range(0,obs_n),min(obs_n,5*10**4))
         for k in dataset.keys():
             dataset[k] = dataset[k][idxs]
-    if any(s in env_name for s in ('RocketRecovery', 'DMSD')):
+    if any(s in env_name for s in ('RocketRecovery', 'DMSD', 'Fusion')):
         min_ret, max_ret = return_range(dataset, max_episode_steps)
         print(f'Dataset returns have range [{min_ret}, {max_ret}]')
         print(f'max score: {env.get_normalized_score(max_ret)}')
@@ -69,7 +69,7 @@ def get_env_and_dataset(env_name, max_episode_steps, normalize, online=False):
     else:
         min_ret, max_ret = return_range(dataset, max_episode_steps)
         print(f'Dataset returns have range [{min_ret}, {max_ret}]')
-        print(f'max score: {env.get_normalized_score(max_ret) * 100.0}')
+        print(f'max score: {env.get_normalized_score(max_ret)}')
 
     print("***********************************************************************")
     print(f"Normalize for the state: {normalize}")
